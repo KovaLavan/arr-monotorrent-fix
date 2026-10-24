@@ -10,6 +10,16 @@ TIMEOUT = float(os.getenv("TIMEOUT", "30"))
 app = FastAPI()
 
 
+class MagnetRedirect(Exception):
+    def __init__(self, response: httpx.Response):
+        self.response = response
+
+
+async def _stop_at_magnet(response: httpx.Response):
+    if response.has_redirect_location and response.headers["location"].lower().startswith("magnet:"):
+        raise MagnetRedirect(response)
+
+
 class BencodeError(Exception):
     pass
 
@@ -161,13 +171,23 @@ async def proxy(path: str, request: Request):
 
     body = await request.body()
 
-    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-        r = await client.request(
-            request.method,
-            url,
-            headers=headers,
-            content=body if body else None,
-        )
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT, follow_redirects=True,
+        event_hooks={"response": [_stop_at_magnet]},
+    ) as client:
+        try:
+            r = await client.request(
+                request.method,
+                url,
+                headers=headers,
+                content=body if body else None,
+            )
+        except MagnetRedirect as redirect:
+            # Arr handles magnet redirects as 301/302/303, not 307/308.
+            status = redirect.response.status_code
+            if status in (307, 308):
+                status = 302
+            return Response(status_code=status, headers={"location": redirect.response.headers["location"]})
 
     resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in hop_by_hop}
     content = r.content
